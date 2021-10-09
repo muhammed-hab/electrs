@@ -140,6 +140,7 @@ pub struct Config {
     pub sync_once: bool,
     pub disable_electrum_rpc: bool,
     pub server_banner: String,
+    pub cache_db_path: Option<PathBuf>,
     pub args: Vec<String>,
 }
 
@@ -189,7 +190,7 @@ impl Config {
             .chain(home_config.as_ref().map(AsRef::as_ref))
             .chain(std::iter::once(system_config));
 
-        let (mut config, args) =
+        let (config, args) =
             internal::Config::including_optional_config_files(configs).unwrap_or_exit();
 
         let db_subdir = match config.network {
@@ -199,7 +200,10 @@ impl Config {
             Network::Signet => "signet",
         };
 
-        config.db_dir.push(db_subdir);
+        let db_path = config.db_dir.join(db_subdir);
+        let cache_db_path = config
+            .cache_db_dir
+            .map(|d| d.join(format!("{}-cache", db_subdir)));
 
         let default_daemon_rpc_port = match config.network {
             Network::Bitcoin => 8332,
@@ -250,14 +254,13 @@ impl Config {
             ResolvAddr::resolve_or_exit,
         );
 
-        match config.network {
-            Network::Bitcoin => (),
-            Network::Testnet => config.daemon_dir.push("testnet3"),
-            Network::Regtest => config.daemon_dir.push("regtest"),
-            Network::Signet => config.daemon_dir.push("signet"),
-        }
+        let daemon_dir = match config.network {
+            Network::Bitcoin => config.daemon_dir.clone(),
+            Network::Testnet => config.daemon_dir.join("testnet3"),
+            Network::Regtest => config.daemon_dir.join("regtest"),
+            Network::Signet => config.daemon_dir.join("signet"),
+        };
 
-        let daemon_dir = &config.daemon_dir;
         let daemon_auth = SensitiveAuth(match (config.auth, config.cookie_file) {
             (None, None) => Auth::CookieFile(daemon_dir.join(".cookie")),
             (None, Some(cookie_file)) => Auth::CookieFile(cookie_file),
@@ -297,8 +300,8 @@ impl Config {
 
         let config = Config {
             network: config.network,
-            db_path: config.db_dir,
-            daemon_dir: config.daemon_dir,
+            db_path,
+            daemon_dir,
             daemon_auth,
             daemon_rpc_addr,
             daemon_p2p_addr,
@@ -314,6 +317,7 @@ impl Config {
             sync_once: config.sync_once,
             disable_electrum_rpc: config.disable_electrum_rpc,
             server_banner: config.server_banner,
+            cache_db_path,
             args: args.map(|a| a.into_string().unwrap()).collect(),
         };
         eprintln!("{:?}", config);
