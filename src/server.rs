@@ -77,6 +77,11 @@ fn serve() -> Result<()> {
     let new_block_rx = rpc.new_block_notification();
     let mut peers = HashMap::<usize, Peer>::new();
     loop {
+        let mut done = false;
+        while server_rx.is_empty() && !done {
+            done = rpc.sync().context("rpc sync failed")?;
+            peers = notify_peers(&rpc, peers); // peers are disconnected on error.
+        }
         select! {
             recv(rpc.signal().receiver()) -> result => {
                 result.context("signal channel disconnected")?;
@@ -92,11 +97,6 @@ fn serve() -> Result<()> {
             },
             default(config.wait_duration) => (), // sync and update
         };
-        if !server_rx.is_empty() {
-            continue; // continue RPC processing (if not done)
-        }
-        rpc.sync().context("rpc sync failed")?;
-        peers = notify_peers(&rpc, peers); // peers are disconnected on error.
     }
     Ok(())
 }

@@ -88,6 +88,7 @@ enum RpcError {
     // Electrum-specific errors
     BadRequest(anyhow::Error),
     DaemonError(daemon::RpcError),
+    UnavailableIndex,
 }
 
 impl RpcError {
@@ -107,6 +108,7 @@ impl RpcError {
             },
             RpcError::BadRequest(err) => json!({"code": 1, "message": err.to_string()}),
             RpcError::DaemonError(err) => json!({"code": 2, "message": err.message}),
+            RpcError::UnavailableIndex => json!({"code": 3, "message": "index is unavailable"}),
         }
     }
 }
@@ -124,7 +126,7 @@ pub struct Rpc {
 
 impl Rpc {
     /// Perform initial index sync (may take a while on first run).
-    pub fn new(config: &Config, mut tracker: Tracker) -> Result<Self> {
+    pub fn new(config: &Config, tracker: Tracker) -> Result<Self> {
         let rpc_duration = tracker.metrics().histogram_vec(
             "rpc_duration",
             "RPC duration (in seconds)",
@@ -134,10 +136,6 @@ impl Rpc {
 
         let signal = Signal::new();
         let daemon = Daemon::connect(config, signal.exit_flag(), tracker.metrics())?;
-        tracker
-            .sync(&daemon, signal.exit_flag())
-            .context("initial sync failed")?;
-
         let cache = Cache::new(tracker.metrics());
         Ok(Self {
             tracker,
@@ -158,7 +156,7 @@ impl Rpc {
         self.daemon.new_block_notification()
     }
 
-    pub fn sync(&mut self) -> Result<()> {
+    pub fn sync(&mut self) -> Result<bool> {
         self.tracker.sync(&self.daemon, self.signal.exit_flag())
     }
 
@@ -433,6 +431,16 @@ impl Rpc {
             Err(err) => return error_msg(id, RpcError::Standard(err)),
         };
         self.rpc_duration.observe_duration(&method, || {
+            if !self.tracker.is_index_ready() {
+                // Allow only a few RPC (for sync status notification) not requiring index DB being compacted.
+                match &call {
+                    Call::BlockHeader(_)
+                    | Call::BlockHeaders(_)
+                    | Call::HeadersSubscribe
+                    | Call::Version(_) => (),
+                    _ => return error_msg(id, RpcError::UnavailableIndex),
+                };
+            }
             let result = match call {
                 Call::Banner => Ok(json!(self.banner)),
                 Call::BlockHeader(args) => self.block_header(args),
