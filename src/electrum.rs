@@ -1,9 +1,5 @@
 use anyhow::{bail, Context, Result};
-use bitcoin::{
-    consensus::{deserialize, serialize},
-    hashes::hex::{FromHex, ToHex},
-    BlockHash, Txid,
-};
+use bitcoin::{consensus::{deserialize, serialize}, hashes::hex::{FromHex, ToHex}, BlockHash, Txid, util::{bip32}, Network, Address};
 use crossbeam_channel::Receiver;
 use rayon::prelude::*;
 use serde_derive::Deserialize;
@@ -11,6 +7,11 @@ use serde_json::{self, json, Value};
 
 use std::collections::{hash_map::Entry, HashMap};
 use std::iter::FromIterator;
+use std::str::FromStr;
+use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::ffi::types::AlignedType;
+use bitcoin::util::bip32::ChildNumber;
+use bitcoin::secp256k1::Secp256k1;
 
 use crate::{
     cache::Cache,
@@ -23,6 +24,7 @@ use crate::{
     tracker::Tracker,
     types::ScriptHash,
 };
+use crate::status::Balance;
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.4";
@@ -120,6 +122,13 @@ pub struct Rpc {
     signal: Signal,
     banner: String,
     port: u16,
+    network: Network
+}
+
+#[derive(Default, Eq, PartialEq, Serialize)]
+pub struct BalanceWithAddr {
+    address: String,
+    balance: Balance
 }
 
 impl Rpc {
@@ -145,6 +154,7 @@ impl Rpc {
             rpc_duration,
             daemon,
             signal,
+            network: config.network,
             banner: config.server_banner.clone(),
             port: config.electrum_rpc_addr.port(),
         })
@@ -259,6 +269,51 @@ impl Rpc {
             }
         };
         Ok(json!(balance))
+    }
+
+    fn get_xpub_balance(
+        &self,
+        client: &Client,
+        (xpub,): (String,),
+    ) -> Result<Value> {
+        let node = bip32::ExtendedPubKey::from_str(&xpub).unwrap();
+        let mut empty_addresses = 0;
+        let mut addr_index = 0;
+        let mut addresses: Vec<BalanceWithAddr> = Vec::new();
+        loop {
+            let mut buf: Vec<AlignedType> = Vec::new();
+            buf.resize(Secp256k1::preallocate_size(), AlignedType::zeroed());
+            let secp = Secp256k1::preallocated_new(buf.as_mut_slice()).unwrap();
+            let child = node.ckd_pub(&secp, ChildNumber::Normal { index: addr_index }).unwrap();
+            let addr = Address::p2wpkh(&child.public_key, self.network).unwrap();
+            let script = Address::script_pubkey(&addr);
+            let hash = bitcoin::hashes::sha256::Hash::hash(script.as_bytes());
+            let scripthash = ScriptHash::from_hex(&hash.iter().copied().rev()
+                .collect::<Vec<u8>>().to_hex())?;
+
+            let balance = match client.scripthashes.get(&scripthash) {
+                Some(status) => self.tracker.get_balance(status),
+                None => self.tracker.get_balance(&self.new_status(scripthash)?)
+            };
+            if balance.confirmed_balance.as_sat() != 0 || balance.mempool_delta.as_sat() != 0 {
+                empty_addresses = 0;
+                addresses.push(BalanceWithAddr { address: addr.to_string(), balance });
+            } else {
+                let status;
+                let history_entries = match client.scripthashes.get(&scripthash) {
+                    Some(status) => status.get_history(),
+                    None => {
+                        status = self.new_status(scripthash)?;
+                        status.get_history()
+                    }
+                };
+                if history_entries.len() != 0 { empty_addresses = 0; }
+                else { empty_addresses += 1; }
+            }
+            if empty_addresses >= 20 { break; }
+            addr_index += 1;
+        }
+        Ok(json!(addresses))
     }
 
     fn scripthash_get_history(
@@ -446,6 +501,7 @@ impl Rpc {
                 Call::Ping => Ok(Value::Null),
                 Call::RelayFee => self.relayfee(),
                 Call::ScriptHashGetBalance(args) => self.scripthash_get_balance(client, args),
+                Call::XPUBGetBalance(args) => self.get_xpub_balance(client, args),
                 Call::ScriptHashGetHistory(args) => self.scripthash_get_history(client, args),
                 Call::ScriptHashListUnspent(args) => self.scripthash_list_unspent(client, args),
                 Call::ScriptHashSubscribe(args) => self.scripthash_subscribe(client, args),
@@ -487,6 +543,7 @@ enum Call {
     RelayFee,
     ScriptHashGetBalance((ScriptHash,)),
     ScriptHashGetHistory((ScriptHash,)),
+    XPUBGetBalance((String,)),
     ScriptHashListUnspent((ScriptHash,)),
     ScriptHashSubscribe((ScriptHash,)),
     TransactionGet(TxGetArgs),
@@ -503,6 +560,7 @@ impl Call {
             "blockchain.headers.subscribe" => Call::HeadersSubscribe,
             "blockchain.relayfee" => Call::RelayFee,
             "blockchain.scripthash.get_balance" => Call::ScriptHashGetBalance(convert(params)?),
+            "blockchain.xpub.get_balance" => Call::XPUBGetBalance(convert(params)?),
             "blockchain.scripthash.get_history" => Call::ScriptHashGetHistory(convert(params)?),
             "blockchain.scripthash.listunspent" => Call::ScriptHashListUnspent(convert(params)?),
             "blockchain.scripthash.subscribe" => Call::ScriptHashSubscribe(convert(params)?),

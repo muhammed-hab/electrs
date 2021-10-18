@@ -137,9 +137,9 @@ pub struct ScriptHashStatus {
 #[derive(Default, Eq, PartialEq, Serialize)]
 pub(crate) struct Balance {
     #[serde(with = "bitcoin::util::amount::serde::as_sat", rename = "confirmed")]
-    confirmed_balance: Amount,
+    pub(crate) confirmed_balance: Amount,
     #[serde(with = "bitcoin::util::amount::serde::as_sat", rename = "unconfirmed")]
-    mempool_delta: SignedAmount,
+    pub(crate) mempool_delta: SignedAmount,
 }
 
 // A single unspent transaction output entry:
